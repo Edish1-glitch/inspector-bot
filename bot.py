@@ -2,7 +2,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 import pytz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters, ConversationHandler
@@ -23,7 +23,6 @@ SHIFTS = {
     "כפולה לילה": {"start": (19, 0), "end": (7, 0)},
 }
 
-# Aliases for reverse order input
 SHIFT_ALIASES = {
     "בוקר כפולה": "כפולה בוקר",
     "לילה כפולה": "כפולה לילה",
@@ -33,16 +32,12 @@ DAY_MAP = {
     "ראשון": 6, "שני": 0, "שלישי": 1,
     "רביעי": 2, "חמישי": 3, "שישי": 4, "שבת": 5
 }
-
 DAY_NUM_TO_HE = {v: k for k, v in DAY_MAP.items()}
 
 WAITING_FOR_SHIFTS = 1
 WAITING_FOR_UPDATE = 2
-WAITING_FOR_REMOVE = 3
 
 pending = {}
-pending_confirmations = {}
-
 
 HELP_TEXT = (
     "👷 *ברוך הבא לבוט תזכורות Inspector!*\n\n"
@@ -50,19 +45,26 @@ HELP_TEXT = (
     "אם לא תאשר — הוא ינודניק כל 2.5 דקות 😄\n\n"
     "📋 *פקודות זמינות:*\n\n"
     "/set\\_shifts — הגדרת משמרות לשבוע\n"
-    "/update — עדכון או הוספת משמרת ליום ספציפי\n"
-    "/remove — הסרת משמרת מיום ספציפי\n"
+    "/update — עדכון, הוספה או הסרה של משמרת\n"
     "/list\\_shifts — צפייה בכל המשמרות המוגדרות\n"
-    "/test — בדיקת הזרימה (תזכורת לדוגמה)\n"
+    "/test — בדיקת הזרימה עם תזכורת לדוגמה\n"
     "/help — הצגת הודעה זו מחדש\n\n"
     "📝 *סוגי משמרות:*\n"
     "בוקר | צהריים | לילה | כפולה בוקר | כפולה לילה\n\n"
     "📅 *ימים:* ראשון שני שלישי רביעי חמישי שישי שבת"
 )
 
+MAIN_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📅 הגדר משמרות לשבוע", callback_data="menu_set_shifts")],
+    [
+        InlineKeyboardButton("✏️ עדכן / הסר משמרת", callback_data="menu_update"),
+        InlineKeyboardButton("📋 הצג משמרות", callback_data="menu_list"),
+    ],
+    [InlineKeyboardButton("🧪 טסט", callback_data="menu_test")],
+])
 
-def normalize_shift(text: str):
-    """Normalize shift name including aliases."""
+
+def normalize_shift(text):
     text = text.strip()
     if text in SHIFT_ALIASES:
         return SHIFT_ALIASES[text]
@@ -71,10 +73,8 @@ def normalize_shift(text: str):
     return None
 
 
-def parse_shifts_from_text(text: str):
-    """Parse shifts from flexible natural language input, supports multiline."""
+def parse_shifts_from_text(text):
     results = []
-    # Split by newlines first, then parse each line
     lines = text.replace("\r", "\n").split("\n")
     for line in lines:
         line = line.replace(":", " ").strip()
@@ -83,65 +83,44 @@ def parse_shifts_from_text(text: str):
         tokens = line.split()
         i = 0
         while i < len(tokens):
-            token = tokens[i]
-            if token in DAY_MAP:
-                day_str = token
-                shift_str = None
-                # Try 2-word shift first
+            if tokens[i] in DAY_MAP:
+                day_str = tokens[i]
                 if i + 2 < len(tokens):
                     candidate2 = tokens[i+1] + " " + tokens[i+2]
-                    normalized = normalize_shift(candidate2)
-                    if normalized:
-                        shift_str = normalized
+                    norm = normalize_shift(candidate2)
+                    if norm:
+                        results.append((day_str, norm, DAY_MAP[day_str]))
                         i += 3
-                        results.append((day_str, shift_str, DAY_MAP[day_str]))
                         continue
-                # Try 1-word shift
                 if i + 1 < len(tokens):
                     candidate1 = tokens[i+1]
-                    normalized = normalize_shift(candidate1)
-                    if normalized:
-                        shift_str = normalized
+                    norm = normalize_shift(candidate1)
+                    if norm:
+                        results.append((day_str, norm, DAY_MAP[day_str]))
                         i += 2
-                        results.append((day_str, shift_str, DAY_MAP[day_str]))
                         continue
-                i += 1
-            else:
-                i += 1
+            i += 1
     return results
-
-
-def parse_single_shift(text: str):
-    """Parse a single day+shift from text."""
-    results = parse_shifts_from_text(text)
-    if results:
-        return results[0]
-    return None
 
 
 def _schedule_shift_reminder(context, weekday, time_tuple, shift_name, action, job_name):
     hour, minute = time_tuple
     now = datetime.now(TZ)
-
-    # Calculate reminder time (5 min before)
-    reminder_hour = hour
     reminder_minute = minute - 5
+    reminder_hour = hour
     if reminder_minute < 0:
         reminder_minute += 60
         reminder_hour -= 1
         if reminder_hour < 0:
             reminder_hour += 24
-
     days_ahead = weekday - now.weekday()
     if days_ahead < 0:
         days_ahead += 7
-
-    target = now + timedelta(days=days_ahead)
-    target = target.replace(hour=reminder_hour, minute=reminder_minute, second=0, microsecond=0)
-
+    target = (now + timedelta(days=days_ahead)).replace(
+        hour=reminder_hour, minute=reminder_minute, second=0, microsecond=0
+    )
     if target < now:
         target += timedelta(weeks=1)
-
     context.job_queue.run_once(
         send_reminder,
         when=target,
@@ -152,332 +131,296 @@ def _schedule_shift_reminder(context, weekday, time_tuple, shift_name, action, j
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+def _remove_day_jobs(context, day_str):
+    removed = False
+    for job in context.job_queue.jobs():
+        if job.name in (f"shift_start_{day_str}", f"shift_end_{day_str}"):
+            job.schedule_removal()
+            removed = True
+    return removed
 
+
+def _add_day_shift(context, day_str, shift_str, day_num):
+    shift = SHIFTS[shift_str]
+    _schedule_shift_reminder(context, day_num, shift["start"], shift_str, "כניסה", f"shift_start_{day_str}")
+    _schedule_shift_reminder(context, day_num, shift["end"], shift_str, "יציאה", f"shift_end_{day_str}")
+
+
+async def _send_or_edit(update, text, parse_mode=None, reply_markup=None):
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
+# ── START / HELP ──────────────────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
-# ── SET SHIFTS (conversation) ──────────────────────────────────────────────
+# ── SET SHIFTS ────────────────────────────────────────────────────────────────
 
 async def set_shifts_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != USER_ID:
         return ConversationHandler.END
-    await update.message.reply_text(
+    msg = (
         "📅 שלח לי את המשמרות שלך לשבוע.\n\n"
-        "אפשר בשורה אחת:\n"
-        "`ראשון בוקר שני לילה שישי כפולה בוקר`\n\n"
-        "או שורה אחרי שורה:\n"
-        "`ראשון בוקר`\n`שני לילה`\n`שישי כפולה בוקר`",
-        parse_mode="Markdown"
+        "אפשר בשורה אחת:\n`ראשון בוקר שני לילה שישי כפולה בוקר`\n\n"
+        "או שורה אחרי שורה:\n`ראשון בוקר`\n`שני לילה`\n`שישי כפולה בוקר`\n\n"
+        "שלח /cancel לביטול."
     )
+    await _send_or_edit(update, msg, parse_mode="Markdown")
     return WAITING_FOR_SHIFTS
 
-
 async def set_shifts_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    parsed = parse_shifts_from_text(text)
-
+    parsed = parse_shifts_from_text(update.message.text)
     if not parsed:
-        await update.message.reply_text(
-            "לא הצלחתי להבין את המשמרות 😅\nנסה שוב או שלח /help לעזרה."
-        )
+        await update.message.reply_text("לא הצלחתי להבין את המשמרות 😅\nנסה שוב או /cancel.")
         return WAITING_FOR_SHIFTS
-
-    # Remove existing shift jobs
     for job in context.job_queue.jobs():
         if job.name.startswith("shift_"):
             job.schedule_removal()
-
     scheduled = []
     for day_str, shift_str, day_num in parsed:
-        shift = SHIFTS[shift_str]
-        _schedule_shift_reminder(context, day_num, shift["start"], shift_str, "כניסה", f"shift_start_{day_str}")
-        _schedule_shift_reminder(context, day_num, shift["end"], shift_str, "יציאה", f"shift_end_{day_str}")
+        _add_day_shift(context, day_str, shift_str, day_num)
         scheduled.append(f"📌 {day_str}: {shift_str}")
-
-    msg = "✅ המשמרות הוגדרו:\n\n" + "\n".join(scheduled)
-    await update.message.reply_text(msg)
+    await update.message.reply_text("✅ המשמרות הוגדרו:\n\n" + "\n".join(scheduled), reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ביטול ✅")
-    return ConversationHandler.END
+# ── UPDATE / REMOVE ───────────────────────────────────────────────────────────
 
-
-# ── UPDATE SHIFT ────────────────────────────────────────────────────────────
-
-async def update_shift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def update_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != USER_ID:
         return ConversationHandler.END
-    await update.message.reply_text(
-        "✏️ איזו משמרת לעדכן או להוסיף?\n\n"
-        "שלח לי יום ומשמרת, לדוגמה:\n"
-        "`חמישי כפולה בוקר`",
-        parse_mode="Markdown"
+    msg = (
+        "✏️ *עדכון / הסרת משמרת*\n\n"
+        "להוספה או עדכון — שלח יום ומשמרת:\n"
+        "`חמישי כפולה בוקר`\n"
+        "אפשר כמה ימים: `חמישי בוקר שישי לילה`\n\n"
+        "להסרה — שלח עם המילה הסר:\n"
+        "`הסר ראשון`\n"
+        "אפשר כמה ימים: `הסר ראשון שני`\n\n"
+        "שלח /cancel לביטול."
     )
+    await _send_or_edit(update, msg, parse_mode="Markdown")
     return WAITING_FOR_UPDATE
 
+async def update_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
 
-async def update_shift_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    parsed = parse_single_shift(text)
+    if text.startswith("הסר"):
+        days_text = text.replace("הסר", "").strip()
+        days_to_remove = [t for t in days_text.split() if t in DAY_MAP]
+        if not days_to_remove:
+            await update.message.reply_text(
+                "לא הבנתי איזה יום למחוק 😅\nלדוגמה: `הסר ראשון` או `הסר ראשון שני`",
+                parse_mode="Markdown"
+            )
+            return WAITING_FOR_UPDATE
+        context.user_data["pending_remove_days"] = days_to_remove
+        days_str = ", ".join(days_to_remove)
+        await update.message.reply_text(
+            f"האם אתה בטוח שאתה רוצה להסיר את המשמרות של: *{days_str}*?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ כן, הסר", callback_data="confirm_remove"),
+                InlineKeyboardButton("❌ ביטול", callback_data="cancel_action")
+            ]])
+        )
+        return ConversationHandler.END
 
+    parsed = parse_shifts_from_text(text)
     if not parsed:
-        await update.message.reply_text("לא הבנתי 😅 נסה שוב, לדוגמה: `חמישי בוקר`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "לא הבנתי 😅\nלעדכון: `חמישי בוקר`\nלהסרה: `הסר ראשון`",
+            parse_mode="Markdown"
+        )
         return WAITING_FOR_UPDATE
 
-    day_str, shift_str, day_num = parsed
-    context.user_data["pending_update"] = (day_str, shift_str, day_num)
-
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ כן, אני בטוח", callback_data="confirm_update"),
-            InlineKeyboardButton("❌ ביטול", callback_data="cancel_action")
-        ]
-    ]
+    context.user_data["pending_update_shifts"] = parsed
+    lines = "\n".join([f"*{d} {s}*" for d, s, _ in parsed])
     await update.message.reply_text(
-        f"האם אתה בטוח שאתה רוצה להוסיף/לעדכן את משמרת *{day_str} {shift_str}*?",
+        f"האם אתה בטוח שאתה רוצה להוסיף/לעדכן:\n{lines}?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ כן, עדכן", callback_data="confirm_update"),
+            InlineKeyboardButton("❌ ביטול", callback_data="cancel_action")
+        ]])
     )
     return ConversationHandler.END
 
 
-# ── REMOVE SHIFT ────────────────────────────────────────────────────────────
-
-async def remove_shift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != USER_ID:
-        return ConversationHandler.END
-
-    # Show current shifts as options
-    jobs = [j for j in context.job_queue.jobs() if j.name.startswith("shift_start_")]
-    if not jobs:
-        await update.message.reply_text("אין משמרות מוגדרות כרגע.")
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "🗑 איזו משמרת להסיר?\n\nשלח לי את היום, לדוגמה:\n`ראשון`",
-        parse_mode="Markdown"
-    )
-    return WAITING_FOR_REMOVE
-
-
-async def remove_shift_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    day_str = text.split()[0] if text else ""
-
-    if day_str not in DAY_MAP:
-        await update.message.reply_text("לא הכרתי את היום 😅 נסה שוב, לדוגמה: `ראשון`", parse_mode="Markdown")
-        return WAITING_FOR_REMOVE
-
-    # Find the shift for this day
-    start_job = next((j for j in context.job_queue.jobs() if j.name == f"shift_start_{day_str}"), None)
-    if not start_job:
-        await update.message.reply_text(f"לא נמצאה משמרת ביום {day_str}.")
-        return ConversationHandler.END
-
-    shift_name = start_job.data["shift"]
-    context.user_data["pending_remove"] = day_str
-
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ כן, אני בטוח", callback_data="confirm_remove"),
-            InlineKeyboardButton("❌ ביטול", callback_data="cancel_action")
-        ]
-    ]
-    await update.message.reply_text(
-        f"האם אתה בטוח שאתה רוצה להסיר את משמרת *{day_str} {shift_name}*?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return ConversationHandler.END
-
-
-# ── LIST SHIFTS ─────────────────────────────────────────────────────────────
+# ── LIST ──────────────────────────────────────────────────────────────────────
 
 async def list_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jobs = [j for j in context.job_queue.jobs() if j.name.startswith("shift_start_")]
+    jobs = sorted(
+        [j for j in context.job_queue.jobs() if j.name.startswith("shift_start_")],
+        key=lambda j: j.next_t
+    )
     if not jobs:
-        await update.message.reply_text("אין משמרות מוגדרות כרגע.")
+        await _send_or_edit(update, "אין משמרות מוגדרות כרגע.", reply_markup=MAIN_KEYBOARD)
         return
-
-    jobs_sorted = sorted(jobs, key=lambda j: j.next_t)
     msg = "📅 *המשמרות המוגדרות:*\n\n"
-    for job in jobs_sorted:
-        shift_name = job.data["shift"]
-        next_time = job.next_t.astimezone(TZ)
-        date_str = next_time.strftime("%d/%m")
-        day_name = DAY_NUM_TO_HE.get(next_time.weekday(), "")
-        msg += f"📌 {day_name} {date_str} — {shift_name}\n"
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    for job in jobs:
+        t = job.next_t.astimezone(TZ)
+        day_name = DAY_NUM_TO_HE.get(t.weekday(), "")
+        msg += f"📌 {day_name} {t.strftime('%d/%m')} — {job.data['shift']}\n"
+    await _send_or_edit(update, msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
-# ── REMINDERS ───────────────────────────────────────────────────────────────
+# ── REMINDERS ─────────────────────────────────────────────────────────────────
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
-    action = job.data["action"]
-    shift = job.data["shift"]
-    job_name = job.data["job_name"]
-
+    action, shift, job_name = job.data["action"], job.data["shift"], job.data["job_name"]
     pending[job_name] = False
     emoji = "🟢" if action == "כניסה" else "🔴"
-
-    keyboard = [[InlineKeyboardButton(f"✅ סימנתי {action}!", callback_data=f"confirm_{job_name}")]]
-
     await context.bot.send_message(
         chat_id=USER_ID,
         text=f"{emoji} תזכורת! עוד 5 דקות צריך לסמן *{action}* למשמרת {shift} ב-Inspector",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ סימנתי {action}!", callback_data=f"confirm_{job_name}")]])
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"✅ סימנתי {action}!", callback_data=f"confirm_{job_name}")
+        ]])
     )
-
     context.job_queue.run_once(
         nudge_reminder,
-        when=timedelta(seconds=150),  # 2.5 minutes
+        when=timedelta(seconds=150),
         data={"action": action, "shift": shift, "job_name": job_name, "count": 1},
-        name=f"nudge_{job_name}_1",
-        chat_id=USER_ID,
-        user_id=USER_ID
+        name=f"nudge_{job_name}_1", chat_id=USER_ID, user_id=USER_ID
     )
-
 
 async def nudge_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
-    job_name = job.data["job_name"]
-    action = job.data["action"]
-    shift = job.data["shift"]
-    count = job.data["count"]
-
+    job_name, action, shift, count = job.data["job_name"], job.data["action"], job.data["shift"], job.data["count"]
     if pending.get(job_name):
         return
-
     await context.bot.send_message(
         chat_id=USER_ID,
         text=f"⚠️ עוד לא סימנת *{action}* למשמרת {shift}! אל תשכח!",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ סימנתי {action}!", callback_data=f"confirm_{job_name}")]])
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"✅ סימנתי {action}!", callback_data=f"confirm_{job_name}")
+        ]])
     )
-
-    next_count = count + 1
     context.job_queue.run_once(
         nudge_reminder,
-        when=timedelta(seconds=150),  # 2.5 minutes
-        data={"action": action, "shift": shift, "job_name": job_name, "count": next_count},
-        name=f"nudge_{job_name}_{next_count}",
-        chat_id=USER_ID,
-        user_id=USER_ID
+        when=timedelta(seconds=150),
+        data={"action": action, "shift": shift, "job_name": job_name, "count": count + 1},
+        name=f"nudge_{job_name}_{count+1}", chat_id=USER_ID, user_id=USER_ID
     )
 
 
-# ── TEST ─────────────────────────────────────────────────────────────────────
+# ── TEST ──────────────────────────────────────────────────────────────────────
 
 async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != USER_ID:
         return
-
     job_name = "test_job"
     pending[job_name] = False
-
-    await update.message.reply_text(
+    msg = (
         "🧪 *זוהי הודעת טסט!*\n\n"
         "🟢 תזכורת! עוד 5 דקות צריך לסמן *כניסה* למשמרת בוקר ב-Inspector\n\n"
-        "לחץ על הכפתור לאישור — אחרת הבוט ינודניק כל 2.5 דקות 😄",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ סימנתי כניסה!", callback_data=f"confirm_{job_name}")]])
+        "לחץ על הכפתור לאישור — אחרת הבוט ינודניק כל 2.5 דקות 😄"
     )
-
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ סימנתי כניסה!", callback_data=f"confirm_{job_name}")
+    ]])
+    await _send_or_edit(update, msg, parse_mode="Markdown", reply_markup=keyboard)
     context.job_queue.run_once(
         nudge_reminder,
         when=timedelta(seconds=10),
         data={"action": "כניסה", "shift": "בוקר (טסט)", "job_name": job_name, "count": 1},
-        name=f"nudge_{job_name}_1",
-        chat_id=USER_ID,
-        user_id=USER_ID
+        name=f"nudge_{job_name}_1", chat_id=USER_ID, user_id=USER_ID
     )
 
 
-# ── CALLBACKS ────────────────────────────────────────────────────────────────
+# ── CANCEL ────────────────────────────────────────────────────────────────────
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ ביטול.", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+# ── CALLBACKS ─────────────────────────────────────────────────────────────────
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    # Confirm shift reminder
-    if data.startswith("confirm_") and not data in ("confirm_update", "confirm_remove"):
+    if data == "menu_set_shifts":
+        await set_shifts_start(update, context)
+    elif data == "menu_update":
+        await update_start(update, context)
+    elif data == "menu_list":
+        await list_shifts(update, context)
+    elif data == "menu_test":
+        await test_reminder(update, context)
+
+    elif data.startswith("confirm_") and data not in ("confirm_update", "confirm_remove"):
         job_name = data.replace("confirm_", "")
         pending[job_name] = True
         for job in context.job_queue.jobs():
             if job.name.startswith(f"nudge_{job_name}"):
                 job.schedule_removal()
         await query.edit_message_text(
-            text=query.message.text + "\n\n✅ *מעולה! סומן בהצלחה!*",
+            query.message.text + "\n\n✅ *מעולה! סומן בהצלחה!*",
             parse_mode="Markdown"
         )
 
-    # Confirm update
     elif data == "confirm_update":
-        pending_update = context.user_data.get("pending_update")
-        if not pending_update:
-            await query.edit_message_text("משהו השתבש, נסה שוב.")
-            return
-        day_str, shift_str, day_num = pending_update
-        shift = SHIFTS[shift_str]
-        # Remove existing jobs for this day
-        for job in context.job_queue.jobs():
-            if job.name in (f"shift_start_{day_str}", f"shift_end_{day_str}"):
-                job.schedule_removal()
-        _schedule_shift_reminder(context, day_num, shift["start"], shift_str, "כניסה", f"shift_start_{day_str}")
-        _schedule_shift_reminder(context, day_num, shift["end"], shift_str, "יציאה", f"shift_end_{day_str}")
-        await query.edit_message_text(f"✅ משמרת *{day_str} {shift_str}* עודכנה!", parse_mode="Markdown")
+        parsed = context.user_data.get("pending_update_shifts", [])
+        for day_str, shift_str, day_num in parsed:
+            _remove_day_jobs(context, day_str)
+            _add_day_shift(context, day_str, shift_str, day_num)
+        lines = "\n".join([f"📌 {d}: {s}" for d, s, _ in parsed])
+        await query.edit_message_text("✅ עודכן בהצלחה!\n\n" + lines, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
-    # Confirm remove
     elif data == "confirm_remove":
-        day_str = context.user_data.get("pending_remove")
-        if not day_str:
-            await query.edit_message_text("משהו השתבש, נסה שוב.")
-            return
-        removed = False
-        for job in context.job_queue.jobs():
-            if job.name in (f"shift_start_{day_str}", f"shift_end_{day_str}"):
-                job.schedule_removal()
-                removed = True
-        if removed:
-            await query.edit_message_text(f"✅ משמרת יום *{day_str}* הוסרה!", parse_mode="Markdown")
-        else:
-            await query.edit_message_text(f"לא נמצאה משמרת ביום {day_str}.")
+        days = context.user_data.get("pending_remove_days", [])
+        removed, not_found = [], []
+        for day_str in days:
+            (removed if _remove_day_jobs(context, day_str) else not_found).append(day_str)
+        msg = ""
+        if removed: msg += "✅ הוסר: " + ", ".join(removed) + "\n"
+        if not_found: msg += "⚠️ לא נמצאה משמרת: " + ", ".join(not_found)
+        await query.edit_message_text(msg.strip(), reply_markup=MAIN_KEYBOARD)
 
-    # Cancel
     elif data == "cancel_action":
-        await query.edit_message_text("❌ הפעולה בוטלה.")
+        await query.edit_message_text("❌ הפעולה בוטלה.", reply_markup=MAIN_KEYBOARD)
 
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "התחל / תפריט ראשי"),
+        BotCommand("set_shifts", "הגדר משמרות לשבוע"),
+        BotCommand("update", "עדכן, הוסף או הסר משמרת"),
+        BotCommand("list_shifts", "הצג את המשמרות המוגדרות"),
+        BotCommand("test", "שלח תזכורת לדוגמה"),
+        BotCommand("help", "עזרה"),
+        BotCommand("cancel", "ביטול פעולה נוכחית"),
+    ])
+
 
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     set_shifts_conv = ConversationHandler(
         entry_points=[CommandHandler("set_shifts", set_shifts_start)],
         states={WAITING_FOR_SHIFTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_shifts_receive)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     update_conv = ConversationHandler(
-        entry_points=[CommandHandler("update", update_shift_start)],
-        states={WAITING_FOR_UPDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_shift_receive)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    remove_conv = ConversationHandler(
-        entry_points=[CommandHandler("remove", remove_shift_start)],
-        states={WAITING_FOR_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_shift_receive)]},
+        entry_points=[CommandHandler("update", update_start)],
+        states={WAITING_FOR_UPDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_receive)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
@@ -487,9 +430,7 @@ def main():
     app.add_handler(CommandHandler("test", test_reminder))
     app.add_handler(set_shifts_conv)
     app.add_handler(update_conv)
-    app.add_handler(remove_conv)
     app.add_handler(CallbackQueryHandler(button_callback))
-
     app.run_polling()
 
 
