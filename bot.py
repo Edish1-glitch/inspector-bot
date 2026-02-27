@@ -35,14 +35,14 @@ DAY_MAP = {
 DAY_NUM_TO_HE = {v: k for k, v in DAY_MAP.items()}
 
 WAITING_FOR_SHIFTS = 1
-WAITING_FOR_UPDATE = 2
+WAITING_FOR_MORE_SHIFTS = 2
+WAITING_FOR_UPDATE = 3
 
 pending = {}
-
-# approved_users: set of user_ids that are approved
-# We store in memory — persists as long as bot is running
 approved_users: set = set()
 approved_users.add(ADMIN_ID)
+# Store display names for approved users
+user_names: dict = {}
 
 HELP_TEXT = (
     "👷 *ברוך הבא לבוט תזכורות Inspector!*\n\n"
@@ -50,7 +50,7 @@ HELP_TEXT = (
     "אם לא תאשר — תמשיך לקבל התראות כל 2.5 דקות עד שתסמן אישור 😄\n\n"
     "את כל הפקודות הזמינות ניתן למצוא בכפתור התפריט הכחול ליד שורת ההקלדה.\n\n"
     "❓ במידה ואתה צריך עזרה או משהו לא ברור — לחץ על /help "
-    "או הקלד אותו וההודעה הזו תקפוץ שוב עם הסבר על כל פקודה.\n\n"
+    "או הקלד אותו וההודעה הזו תקפוץ שוב.\n\n"
     "📝 *סוגי משמרות:*\n"
     "בוקר | צהריים | לילה | כפולה בוקר | כפולה לילה\n\n"
     "📅 *ימים:* ראשון שני שלישי רביעי חמישי שישי שבת"
@@ -69,10 +69,14 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🧪 טסט", callback_data="menu_test")],
 ])
 
+ADD_MORE_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton("➕ הוסף עוד משמרת", callback_data="add_more_shifts"),
+    InlineKeyboardButton("✅ סיימתי", callback_data="done_shifts"),
+]])
 
-def is_approved(user_id: int) -> bool:
+
+def is_approved(user_id):
     return user_id in approved_users
-
 
 def normalize_shift(text):
     text = text.strip()
@@ -81,7 +85,6 @@ def normalize_shift(text):
     if text in SHIFTS:
         return text
     return None
-
 
 def parse_shifts_from_text(text):
     results = []
@@ -111,7 +114,6 @@ def parse_shifts_from_text(text):
             i += 1
     return results
 
-
 def _schedule_shift_reminder(context, user_id, weekday, time_tuple, shift_name, action, job_name):
     hour, minute = time_tuple
     now = datetime.now(TZ)
@@ -139,7 +141,6 @@ def _schedule_shift_reminder(context, user_id, weekday, time_tuple, shift_name, 
         chat_id=user_id
     )
 
-
 def _remove_day_jobs(context, user_id, day_str):
     removed = False
     prefix = f"shift_{user_id}_"
@@ -149,13 +150,26 @@ def _remove_day_jobs(context, user_id, day_str):
             removed = True
     return removed
 
-
 def _add_day_shift(context, user_id, day_str, shift_str, day_num):
     shift = SHIFTS[shift_str]
     prefix = f"shift_{user_id}_"
     _schedule_shift_reminder(context, user_id, day_num, shift["start"], shift_str, "כניסה", f"{prefix}start_{day_str}")
     _schedule_shift_reminder(context, user_id, day_num, shift["end"], shift_str, "יציאה", f"{prefix}end_{day_str}")
 
+def _get_user_shifts_text(context, user_id):
+    prefix = f"shift_{user_id}_start_"
+    jobs = sorted(
+        [j for j in context.job_queue.jobs() if j.name.startswith(prefix)],
+        key=lambda j: j.next_t
+    )
+    if not jobs:
+        return None
+    lines = []
+    for job in jobs:
+        t = job.next_t.astimezone(TZ)
+        day_name = DAY_NUM_TO_HE.get(t.weekday(), "")
+        lines.append(f"📌 {day_name} {t.strftime('%d/%m')} — {job.data['shift']}")
+    return "\n".join(lines)
 
 async def _send_or_edit(update, text, parse_mode=None, reply_markup=None):
     if update.callback_query:
@@ -164,7 +178,7 @@ async def _send_or_edit(update, text, parse_mode=None, reply_markup=None):
         await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
-# ── ACCESS CONTROL ────────────────────────────────────────────────────────────
+# ── START / HELP ──────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -174,16 +188,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
         return
 
-    # Not approved — send request to admin
     first = user.first_name or ""
     last = user.last_name or ""
     username = f"@{user.username}" if user.username else "ללא שם משתמש"
     full_name = f"{first} {last}".strip()
+    user_names[user_id] = full_name or username
 
     await update.message.reply_text(
         "⏳ בקשת הגישה שלך נשלחה לאדמין. תקבל הודעה ברגע שיאשרו אותך!"
     )
-
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ אשר גישה", callback_data=f"approve_{user_id}"),
         InlineKeyboardButton("❌ דחה", callback_data=f"deny_{user_id}"),
@@ -200,22 +213,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_approved(update.effective_user.id):
         return
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
-# ── SET SHIFTS ────────────────────────────────────────────────────────────────
+# ── SET SHIFTS (with add-more flow) ──────────────────────────────────────────
 
 async def set_shifts_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_approved(update.effective_user.id):
         return ConversationHandler.END
+    # Clear accumulated shifts for this session
+    context.user_data["session_shifts"] = []
     msg = (
-        "📅 שלח לי את המשמרות שלך לשבוע.\n\n"
-        "אפשר בשורה אחת:\n`ראשון בוקר שני לילה שישי כפולה בוקר`\n\n"
-        "או שורה אחרי שורה:\n`ראשון בוקר`\n`שני לילה`\n`שישי כפולה בוקר`"
+        "📅 שלח לי משמרת אחת או יותר.\n\n"
+        "אפשר בשורה אחת: `ראשון בוקר שני לילה`\n"
+        "או שורה אחרי שורה:\n`ראשון בוקר`\n`שני לילה`"
     )
     await _send_or_edit(update, msg, parse_mode="Markdown")
     return WAITING_FOR_SHIFTS
@@ -223,6 +237,7 @@ async def set_shifts_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_shifts_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     parsed = parse_shifts_from_text(update.message.text)
+
     if not parsed:
         await update.message.reply_text(
             "❌ לא הצלחתי להבין את מה שרשמת.\n"
@@ -232,19 +247,77 @@ async def set_shifts_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=BACK_KEYBOARD
         )
         return WAITING_FOR_SHIFTS
+
+    # Accumulate shifts
+    session = context.user_data.get("session_shifts", [])
+    # Avoid duplicates — override same day
+    existing_days = {d for d, _, _ in session}
+    for item in parsed:
+        if item[0] in existing_days:
+            session = [s for s in session if s[0] != item[0]]
+        session.append(item)
+    context.user_data["session_shifts"] = session
+
+    # Show what we have so far
+    lines = "\n".join([f"📌 {d}: {s}" for d, s, _ in sorted(session, key=lambda x: DAY_MAP[x[0]])])
+    await update.message.reply_text(
+        f"*המשמרות שנרשמו עד עכשיו:*\n\n{lines}\n\nרוצה להוסיף עוד?",
+        parse_mode="Markdown",
+        reply_markup=ADD_MORE_KEYBOARD
+    )
+    return WAITING_FOR_MORE_SHIFTS
+
+async def set_shifts_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User sent more shifts during the add-more flow."""
+    user_id = update.effective_user.id
+    parsed = parse_shifts_from_text(update.message.text)
+
+    if not parsed:
+        session = context.user_data.get("session_shifts", [])
+        lines = "\n".join([f"📌 {d}: {s}" for d, s, _ in sorted(session, key=lambda x: DAY_MAP[x[0]])])
+        await update.message.reply_text(
+            f"❌ לא הצלחתי להבין. נסה שוב.\n\n*המשמרות עד עכשיו:*\n{lines}",
+            parse_mode="Markdown",
+            reply_markup=ADD_MORE_KEYBOARD
+        )
+        return WAITING_FOR_MORE_SHIFTS
+
+    session = context.user_data.get("session_shifts", [])
+    for item in parsed:
+        session = [s for s in session if s[0] != item[0]]
+        session.append(item)
+    context.user_data["session_shifts"] = session
+
+    lines = "\n".join([f"📌 {d}: {s}" for d, s, _ in sorted(session, key=lambda x: DAY_MAP[x[0]])])
+    await update.message.reply_text(
+        f"*המשמרות שנרשמו עד עכשיו:*\n\n{lines}\n\nרוצה להוסיף עוד?",
+        parse_mode="Markdown",
+        reply_markup=ADD_MORE_KEYBOARD
+    )
+    return WAITING_FOR_MORE_SHIFTS
+
+async def finalize_shifts(user_id, context, query=None, message=None):
+    """Save all accumulated shifts and confirm."""
+    session = context.user_data.get("session_shifts", [])
+    if not session:
+        return
+
     prefix = f"shift_{user_id}_"
     for job in context.job_queue.jobs():
         if job.name.startswith(prefix):
             job.schedule_removal()
-    scheduled = []
-    for day_str, shift_str, day_num in parsed:
+
+    for day_str, shift_str, day_num in session:
         _add_day_shift(context, user_id, day_str, shift_str, day_num)
-        scheduled.append(f"📌 {day_str}: {shift_str}")
-    await update.message.reply_text(
-        "✅ המשמרות הוגדרו:\n\n" + "\n".join(scheduled),
-        reply_markup=BACK_KEYBOARD
-    )
-    return ConversationHandler.END
+
+    lines = "\n".join([f"📌 {d}: {s}" for d, s, _ in sorted(session, key=lambda x: DAY_MAP[x[0]])])
+    text = f"✅ *המשמרות הוגדרו בהצלחה:*\n\n{lines}"
+    context.user_data["session_shifts"] = []
+
+    if query:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=BACK_KEYBOARD)
+    elif message:
+        await message.reply_text(text, parse_mode="Markdown", reply_markup=BACK_KEYBOARD)
 
 
 # ── UPDATE / REMOVE ───────────────────────────────────────────────────────────
@@ -273,11 +346,8 @@ async def update_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days_to_remove = [t for t in days_text.split() if t in DAY_MAP]
         if not days_to_remove:
             await update.message.reply_text(
-                "❌ לא הצלחתי להבין את מה שרשמת.\n"
-                "ייתכן והייתה טעות כתיב או רווח במקום לא נכון.\n\n"
-                "לדוגמה: `הסר ראשון` או `הסר ראשון שני`",
-                parse_mode="Markdown",
-                reply_markup=BACK_KEYBOARD
+                "❌ לא הצלחתי להבין.\nלדוגמה: `הסר ראשון` או `הסר ראשון שני`",
+                parse_mode="Markdown", reply_markup=BACK_KEYBOARD
             )
             return WAITING_FOR_UPDATE
         context.user_data["pending_remove_days"] = days_to_remove
@@ -299,8 +369,7 @@ async def update_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ לא הצלחתי להבין את מה שרשמת.\n"
             "ייתכן והייתה טעות כתיב או רווח במקום לא נכון.\n\n"
             "לעדכון: `חמישי בוקר`\nלהסרה: `הסר ראשון`",
-            parse_mode="Markdown",
-            reply_markup=BACK_KEYBOARD
+            parse_mode="Markdown", reply_markup=BACK_KEYBOARD
         )
         return WAITING_FOR_UPDATE
 
@@ -322,20 +391,12 @@ async def update_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    prefix = f"shift_{user_id}_start_"
-    jobs = sorted(
-        [j for j in context.job_queue.jobs() if j.name.startswith(prefix)],
-        key=lambda j: j.next_t
-    )
-    if not jobs:
+    shifts_text = _get_user_shifts_text(context, user_id)
+    if not shifts_text:
         await _send_or_edit(update, "אין משמרות מוגדרות כרגע.", reply_markup=BACK_KEYBOARD)
         return
-    msg = "📅 *המשמרות המוגדרות:*\n\n"
-    for job in jobs:
-        t = job.next_t.astimezone(TZ)
-        day_name = DAY_NUM_TO_HE.get(t.weekday(), "")
-        msg += f"📌 {day_name} {t.strftime('%d/%m')} — {job.data['shift']}\n"
-    await _send_or_edit(update, msg, parse_mode="Markdown", reply_markup=BACK_KEYBOARD)
+    await _send_or_edit(update, f"📅 *המשמרות המוגדרות:*\n\n{shifts_text}",
+                        parse_mode="Markdown", reply_markup=BACK_KEYBOARD)
 
 
 # ── REMINDERS ─────────────────────────────────────────────────────────────────
@@ -414,13 +475,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = update.effective_user.id
 
-    # ── Access approval (admin only) ──
+    # ── Access approval ──
     if data.startswith("approve_"):
         if user_id != ADMIN_ID:
             return
         new_user_id = int(data.replace("approve_", ""))
         approved_users.add(new_user_id)
-        await query.edit_message_text(f"✅ המשתמש אושר בהצלחה!")
+        name = user_names.get(new_user_id, "המשתמש")
+        await query.edit_message_text(f"✅ *{name}* אושר בהצלחה!")
         await context.bot.send_message(
             chat_id=new_user_id,
             text="🎉 *קיבלת גישה לבוט!*\nעכשיו אתה יכול להתחיל להשתמש בו.",
@@ -433,16 +495,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID:
             return
         denied_id = int(data.replace("deny_", ""))
-        await query.edit_message_text("❌ הבקשה נדחתה.")
+        name = user_names.get(denied_id, "המשתמש")
+        await query.edit_message_text(f"❌ הבקשה של *{name}* נדחתה.", parse_mode="Markdown")
         await context.bot.send_message(
             chat_id=denied_id,
             text="😔 בקשת הגישה שלך נדחתה. פנה למנהל לפרטים נוספים."
         )
         return
 
-    # ── Check approval for all other actions ──
     if not is_approved(user_id):
         await query.answer("אין לך גישה לבוט.", show_alert=True)
+        return
+
+    # ── Add more / done shifts ──
+    if data == "add_more_shifts":
+        session = context.user_data.get("session_shifts", [])
+        lines = "\n".join([f"📌 {d}: {s}" for d, s, _ in sorted(session, key=lambda x: DAY_MAP[x[0]])])
+        await query.edit_message_text(
+            f"*המשמרות עד עכשיו:*\n\n{lines}\n\nשלח לי את המשמרת הבאה:",
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "done_shifts":
+        await finalize_shifts(user_id, context, query=query)
         return
 
     # ── Menu ──
@@ -513,7 +589,10 @@ def main():
 
     set_shifts_conv = ConversationHandler(
         entry_points=[CommandHandler("set_shifts", set_shifts_start)],
-        states={WAITING_FOR_SHIFTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_shifts_receive)]},
+        states={
+            WAITING_FOR_SHIFTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_shifts_receive)],
+            WAITING_FOR_MORE_SHIFTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_shifts_more)],
+        },
         fallbacks=[],
     )
     update_conv = ConversationHandler(
