@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN")
-USER_ID = int(os.environ.get("USER_ID"))
+ADMIN_ID = int(os.environ.get("USER_ID"))
 TZ = pytz.timezone("Asia/Jerusalem")
 
 SHIFTS = {
@@ -38,6 +38,11 @@ WAITING_FOR_SHIFTS = 1
 WAITING_FOR_UPDATE = 2
 
 pending = {}
+
+# approved_users: set of user_ids that are approved
+# We store in memory — persists as long as bot is running
+approved_users: set = set()
+approved_users.add(ADMIN_ID)
 
 HELP_TEXT = (
     "👷 *ברוך הבא לבוט תזכורות Inspector!*\n\n"
@@ -65,6 +70,10 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
 ])
 
 
+def is_approved(user_id: int) -> bool:
+    return user_id in approved_users
+
+
 def normalize_shift(text):
     text = text.strip()
     if text in SHIFT_ALIASES:
@@ -78,7 +87,6 @@ def parse_shifts_from_text(text):
     results = []
     lines = text.replace("\r", "\n").split("\n")
     for line in lines:
-        # Strip leading/trailing whitespace from each line
         line = line.replace(":", " ").strip()
         if not line:
             continue
@@ -104,7 +112,7 @@ def parse_shifts_from_text(text):
     return results
 
 
-def _schedule_shift_reminder(context, weekday, time_tuple, shift_name, action, job_name):
+def _schedule_shift_reminder(context, user_id, weekday, time_tuple, shift_name, action, job_name):
     hour, minute = time_tuple
     now = datetime.now(TZ)
     reminder_minute = minute - 5
@@ -125,26 +133,28 @@ def _schedule_shift_reminder(context, weekday, time_tuple, shift_name, action, j
     context.job_queue.run_once(
         send_reminder,
         when=target,
-        data={"action": action, "shift": shift_name, "job_name": job_name},
+        data={"action": action, "shift": shift_name, "job_name": job_name, "user_id": user_id},
         name=job_name,
-        user_id=USER_ID,
-        chat_id=USER_ID
+        user_id=user_id,
+        chat_id=user_id
     )
 
 
-def _remove_day_jobs(context, day_str):
+def _remove_day_jobs(context, user_id, day_str):
     removed = False
+    prefix = f"shift_{user_id}_"
     for job in context.job_queue.jobs():
-        if job.name in (f"shift_start_{day_str}", f"shift_end_{day_str}"):
+        if job.name in (f"{prefix}start_{day_str}", f"{prefix}end_{day_str}"):
             job.schedule_removal()
             removed = True
     return removed
 
 
-def _add_day_shift(context, day_str, shift_str, day_num):
+def _add_day_shift(context, user_id, day_str, shift_str, day_num):
     shift = SHIFTS[shift_str]
-    _schedule_shift_reminder(context, day_num, shift["start"], shift_str, "כניסה", f"shift_start_{day_str}")
-    _schedule_shift_reminder(context, day_num, shift["end"], shift_str, "יציאה", f"shift_end_{day_str}")
+    prefix = f"shift_{user_id}_"
+    _schedule_shift_reminder(context, user_id, day_num, shift["start"], shift_str, "כניסה", f"{prefix}start_{day_str}")
+    _schedule_shift_reminder(context, user_id, day_num, shift["end"], shift_str, "יציאה", f"{prefix}end_{day_str}")
 
 
 async def _send_or_edit(update, text, parse_mode=None, reply_markup=None):
@@ -154,19 +164,53 @@ async def _send_or_edit(update, text, parse_mode=None, reply_markup=None):
         await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
-# ── START / HELP ──────────────────────────────────────────────────────────────
+# ── ACCESS CONTROL ────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+    user = update.effective_user
+    user_id = user.id
+
+    if is_approved(user_id):
+        await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+        return
+
+    # Not approved — send request to admin
+    first = user.first_name or ""
+    last = user.last_name or ""
+    username = f"@{user.username}" if user.username else "ללא שם משתמש"
+    full_name = f"{first} {last}".strip()
+
+    await update.message.reply_text(
+        "⏳ בקשת הגישה שלך נשלחה לאדמין. תקבל הודעה ברגע שיאשרו אותך!"
+    )
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ אשר גישה", callback_data=f"approve_{user_id}"),
+        InlineKeyboardButton("❌ דחה", callback_data=f"deny_{user_id}"),
+    ]])
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"🔔 *בקשת גישה חדשה!*\n\n"
+            f"👤 שם: {full_name}\n"
+            f"🆔 {username}\n\n"
+            f"האם לאשר גישה לבוט?"
+        ),
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_approved(update.effective_user.id):
+        return
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
 # ── SET SHIFTS ────────────────────────────────────────────────────────────────
 
 async def set_shifts_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != USER_ID:
+    if not is_approved(update.effective_user.id):
         return ConversationHandler.END
     msg = (
         "📅 שלח לי את המשמרות שלך לשבוע.\n\n"
@@ -177,22 +221,24 @@ async def set_shifts_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_FOR_SHIFTS
 
 async def set_shifts_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     parsed = parse_shifts_from_text(update.message.text)
     if not parsed:
         await update.message.reply_text(
             "❌ לא הצלחתי להבין את מה שרשמת.\n"
             "ייתכן והייתה טעות כתיב או רווח במקום לא נכון.\n\n"
-            "נסה שוב, לדוגמה:\n`ראשון בוקר`\n`שני לילה`\n`שישי כפולה בוקר`",
+            "נסה שוב, לדוגמה:\n`ראשון בוקר`\n`שני לילה`",
             parse_mode="Markdown",
             reply_markup=BACK_KEYBOARD
         )
         return WAITING_FOR_SHIFTS
+    prefix = f"shift_{user_id}_"
     for job in context.job_queue.jobs():
-        if job.name.startswith("shift_"):
+        if job.name.startswith(prefix):
             job.schedule_removal()
     scheduled = []
     for day_str, shift_str, day_num in parsed:
-        _add_day_shift(context, day_str, shift_str, day_num)
+        _add_day_shift(context, user_id, day_str, shift_str, day_num)
         scheduled.append(f"📌 {day_str}: {shift_str}")
     await update.message.reply_text(
         "✅ המשמרות הוגדרו:\n\n" + "\n".join(scheduled),
@@ -204,7 +250,7 @@ async def set_shifts_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ── UPDATE / REMOVE ───────────────────────────────────────────────────────────
 
 async def update_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != USER_ID:
+    if not is_approved(update.effective_user.id):
         return ConversationHandler.END
     msg = (
         "✏️ *עדכון / הסרת משמרת*\n\n"
@@ -219,6 +265,7 @@ async def update_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_FOR_UPDATE
 
 async def update_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     text = update.message.text.strip()
 
     if text.startswith("הסר"):
@@ -234,6 +281,7 @@ async def update_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return WAITING_FOR_UPDATE
         context.user_data["pending_remove_days"] = days_to_remove
+        context.user_data["pending_user_id"] = user_id
         days_str = ", ".join(days_to_remove)
         await update.message.reply_text(
             f"האם אתה בטוח שאתה רוצה להסיר את המשמרות של: *{days_str}*?",
@@ -257,6 +305,7 @@ async def update_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_FOR_UPDATE
 
     context.user_data["pending_update_shifts"] = parsed
+    context.user_data["pending_user_id"] = user_id
     lines = "\n".join([f"*{d} {s}*" for d, s, _ in parsed])
     await update.message.reply_text(
         f"האם אתה בטוח שאתה רוצה להוסיף/לעדכן:\n{lines}?",
@@ -272,8 +321,10 @@ async def update_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── LIST ──────────────────────────────────────────────────────────────────────
 
 async def list_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    prefix = f"shift_{user_id}_start_"
     jobs = sorted(
-        [j for j in context.job_queue.jobs() if j.name.startswith("shift_start_")],
+        [j for j in context.job_queue.jobs() if j.name.startswith(prefix)],
         key=lambda j: j.next_t
     )
     if not jobs:
@@ -291,11 +342,11 @@ async def list_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
-    action, shift, job_name = job.data["action"], job.data["shift"], job.data["job_name"]
+    action, shift, job_name, user_id = job.data["action"], job.data["shift"], job.data["job_name"], job.data["user_id"]
     pending[job_name] = False
     emoji = "🟢" if action == "כניסה" else "🔴"
     await context.bot.send_message(
-        chat_id=USER_ID,
+        chat_id=user_id,
         text=f"{emoji} תזכורת! עוד 5 דקות צריך לסמן *{action}* למשמרת {shift} ב-Inspector",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
@@ -305,17 +356,17 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     context.job_queue.run_once(
         nudge_reminder,
         when=timedelta(seconds=150),
-        data={"action": action, "shift": shift, "job_name": job_name, "count": 1},
-        name=f"nudge_{job_name}_1", chat_id=USER_ID, user_id=USER_ID
+        data={"action": action, "shift": shift, "job_name": job_name, "count": 1, "user_id": user_id},
+        name=f"nudge_{job_name}_1", chat_id=user_id, user_id=user_id
     )
 
 async def nudge_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
-    job_name, action, shift, count = job.data["job_name"], job.data["action"], job.data["shift"], job.data["count"]
+    job_name, action, shift, count, user_id = job.data["job_name"], job.data["action"], job.data["shift"], job.data["count"], job.data["user_id"]
     if pending.get(job_name):
         return
     await context.bot.send_message(
-        chat_id=USER_ID,
+        chat_id=user_id,
         text=f"⚠️ עוד לא סימנת *{action}* למשמרת {shift}! אל תשכח!",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
@@ -325,17 +376,18 @@ async def nudge_reminder(context: ContextTypes.DEFAULT_TYPE):
     context.job_queue.run_once(
         nudge_reminder,
         when=timedelta(seconds=150),
-        data={"action": action, "shift": shift, "job_name": job_name, "count": count + 1},
-        name=f"nudge_{job_name}_{count+1}", chat_id=USER_ID, user_id=USER_ID
+        data={"action": action, "shift": shift, "job_name": job_name, "count": count + 1, "user_id": user_id},
+        name=f"nudge_{job_name}_{count+1}", chat_id=user_id, user_id=user_id
     )
 
 
 # ── TEST ──────────────────────────────────────────────────────────────────────
 
 async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != USER_ID:
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
         return
-    job_name = "test_job"
+    job_name = f"test_job_{user_id}"
     pending[job_name] = False
     msg = (
         "🧪 *זוהי הודעת טסט!*\n\n"
@@ -349,8 +401,8 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.job_queue.run_once(
         nudge_reminder,
         when=timedelta(seconds=10),
-        data={"action": "כניסה", "shift": "בוקר (טסט)", "job_name": job_name, "count": 1},
-        name=f"nudge_{job_name}_1", chat_id=USER_ID, user_id=USER_ID
+        data={"action": "כניסה", "shift": "בוקר (טסט)", "job_name": job_name, "count": 1, "user_id": user_id},
+        name=f"nudge_{job_name}_1", chat_id=user_id, user_id=user_id
     )
 
 
@@ -360,7 +412,40 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = update.effective_user.id
 
+    # ── Access approval (admin only) ──
+    if data.startswith("approve_"):
+        if user_id != ADMIN_ID:
+            return
+        new_user_id = int(data.replace("approve_", ""))
+        approved_users.add(new_user_id)
+        await query.edit_message_text(f"✅ המשתמש אושר בהצלחה!")
+        await context.bot.send_message(
+            chat_id=new_user_id,
+            text="🎉 *קיבלת גישה לבוט!*\nעכשיו אתה יכול להתחיל להשתמש בו.",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD
+        )
+        return
+
+    if data.startswith("deny_"):
+        if user_id != ADMIN_ID:
+            return
+        denied_id = int(data.replace("deny_", ""))
+        await query.edit_message_text("❌ הבקשה נדחתה.")
+        await context.bot.send_message(
+            chat_id=denied_id,
+            text="😔 בקשת הגישה שלך נדחתה. פנה למנהל לפרטים נוספים."
+        )
+        return
+
+    # ── Check approval for all other actions ──
+    if not is_approved(user_id):
+        await query.answer("אין לך גישה לבוט.", show_alert=True)
+        return
+
+    # ── Menu ──
     if data == "menu_main":
         await query.edit_message_text(HELP_TEXT, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
     elif data == "menu_set_shifts":
@@ -372,6 +457,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_test":
         await test_reminder(update, context)
 
+    # ── Confirm reminder ──
     elif data.startswith("confirm_") and data not in ("confirm_update", "confirm_remove"):
         job_name = data.replace("confirm_", "")
         pending[job_name] = True
@@ -387,21 +473,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "confirm_update":
         parsed = context.user_data.get("pending_update_shifts", [])
+        uid = context.user_data.get("pending_user_id", user_id)
         for day_str, shift_str, day_num in parsed:
-            _remove_day_jobs(context, day_str)
-            _add_day_shift(context, day_str, shift_str, day_num)
+            _remove_day_jobs(context, uid, day_str)
+            _add_day_shift(context, uid, day_str, shift_str, day_num)
         lines = "\n".join([f"📌 {d}: {s}" for d, s, _ in parsed])
-        await query.edit_message_text(
-            "✅ עודכן בהצלחה!\n\n" + lines,
-            parse_mode="Markdown",
-            reply_markup=BACK_KEYBOARD
-        )
+        await query.edit_message_text("✅ עודכן בהצלחה!\n\n" + lines, parse_mode="Markdown", reply_markup=BACK_KEYBOARD)
 
     elif data == "confirm_remove":
         days = context.user_data.get("pending_remove_days", [])
+        uid = context.user_data.get("pending_user_id", user_id)
         removed, not_found = [], []
         for day_str in days:
-            (removed if _remove_day_jobs(context, day_str) else not_found).append(day_str)
+            (removed if _remove_day_jobs(context, uid, day_str) else not_found).append(day_str)
         msg = ""
         if removed: msg += "✅ הוסר: " + ", ".join(removed) + "\n"
         if not_found: msg += "⚠️ לא נמצאה משמרת: " + ", ".join(not_found)
