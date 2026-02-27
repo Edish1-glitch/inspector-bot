@@ -37,6 +37,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def parse_shifts_from_text(text: str):
+    """Parse shifts from flexible natural language input."""
+    day_map = {
+        "ראשון": 6, "שני": 0, "שלישי": 1,
+        "רביעי": 2, "חמישי": 3, "שישי": 4, "שבת": 5
+    }
+    # Normalize: remove colons, extra spaces
+    text = text.replace(":", " ").replace("_", " ")
+    tokens = text.split()
+
+    results = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in day_map:
+            day_str = token
+            # Collect next 1-2 tokens as shift name
+            shift_str = None
+            if i + 2 < len(tokens):
+                candidate2 = tokens[i+1] + " " + tokens[i+2]
+                if candidate2 in SHIFTS:
+                    shift_str = candidate2
+                    i += 3
+                    results.append((day_str, shift_str, day_map[day_str]))
+                    continue
+            if i + 1 < len(tokens):
+                candidate1 = tokens[i+1]
+                if candidate1 in SHIFTS:
+                    shift_str = candidate1
+                    i += 2
+                    results.append((day_str, shift_str, day_map[day_str]))
+                    continue
+            i += 1
+        else:
+            i += 1
+    return results
+
+
 async def set_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != USER_ID:
         await update.message.reply_text("אין לך הרשאה להשתמש בבוט זה.")
@@ -44,59 +82,41 @@ async def set_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         await update.message.reply_text(
-            "שלח את המשמרות שלך בפורמט:\n"
-            "/set_shifts ראשון:בוקר שני:צהריים שישי:כפולה_בוקר\n\n"
+            "שלח את המשמרות שלך בפורמט חופשי, לדוגמה:\n"
+            "/set_shifts ראשון בוקר שני לילה שישי כפולה בוקר\n\n"
             "סוגי משמרות אפשריים:\n"
-            "בוקר | צהריים | לילה | כפולה_בוקר | כפולה_לילה"
+            "בוקר | צהריים | לילה | כפולה בוקר | כפולה לילה"
         )
         return
 
-    day_map = {
-        "ראשון": 6, "שני": 0, "שלישי": 1,
-        "רביעי": 2, "חמישי": 3, "שישי": 4, "שבת": 5
-    }
+    text = " ".join(context.args)
+    parsed = parse_shifts_from_text(text)
+
+    if not parsed:
+        await update.message.reply_text(
+            "לא הצלחתי להבין את המשמרות 😅\n"
+            "נסה לדוגמה:\n"
+            "/set_shifts ראשון בוקר שני לילה שישי כפולה בוקר"
+        )
+        return
 
     # Remove existing shift jobs
-    current_jobs = context.job_queue.jobs()
-    for job in current_jobs:
+    for job in context.job_queue.jobs():
         if job.name.startswith("shift_"):
             job.schedule_removal()
 
     scheduled = []
-    errors = []
-
-    for arg in context.args:
-        try:
-            day_str, shift_str = arg.split(":")
-            shift_str = shift_str.replace("_", " ")
-            day_num = day_map.get(day_str)
-            shift = SHIFTS.get(shift_str)
-
-            if day_num is None:
-                errors.append(f"יום לא מוכר: {day_str}")
-                continue
-            if shift is None:
-                errors.append(f"משמרת לא מוכרת: {shift_str}")
-                continue
-
-            # Schedule start reminder (5 min before)
-            _schedule_shift_reminder(
-                context, day_num, shift["start"], shift_str, "כניסה", f"shift_start_{day_str}"
-            )
-            # Schedule end reminder (5 min before)
-            _schedule_shift_reminder(
-                context, day_num, shift["end"], shift_str, "יציאה", f"shift_end_{day_str}"
-            )
-
-            scheduled.append(f"{day_str}: {shift_str}")
-
-        except Exception as e:
-            errors.append(f"שגיאה ב-{arg}: {e}")
+    for day_str, shift_str, day_num in parsed:
+        shift = SHIFTS[shift_str]
+        _schedule_shift_reminder(
+            context, day_num, shift["start"], shift_str, "כניסה", f"shift_start_{day_str}"
+        )
+        _schedule_shift_reminder(
+            context, day_num, shift["end"], shift_str, "יציאה", f"shift_end_{day_str}"
+        )
+        scheduled.append(f"{day_str}: {shift_str}")
 
     msg = "✅ המשמרות הוגדרו:\n" + "\n".join(scheduled)
-    if errors:
-        msg += "\n\n⚠️ שגיאות:\n" + "\n".join(errors)
-
     await update.message.reply_text(msg)
 
 
@@ -218,15 +238,55 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jobs = [j for j in context.job_queue.jobs() if j.name.startswith("shift_")]
+    jobs = [j for j in context.job_queue.jobs() if j.name.startswith("shift_start_")]
     if not jobs:
         await update.message.reply_text("אין משמרות מוגדרות כרגע.")
         return
 
-    msg = "📅 המשמרות המוגדרות:\n"
-    for job in jobs:
-        msg += f"• {job.name} - {job.next_t.astimezone(TZ).strftime('%d/%m %H:%M')}\n"
+    # Sort by next run time
+    jobs_sorted = sorted(jobs, key=lambda j: j.next_t)
+
+    msg = "📅 המשמרות המוגדרות:\n\n"
+    for job in jobs_sorted:
+        shift_name = job.data["shift"]
+        next_time = job.next_t.astimezone(TZ)
+        day_date = next_time.strftime("%A %d/%m").replace(
+            "Sunday", "ראשון").replace("Monday", "שני").replace(
+            "Tuesday", "שלישי").replace("Wednesday", "רביעי").replace(
+            "Thursday", "חמישי").replace("Friday", "שישי").replace(
+            "Saturday", "שבת")
+        msg += f"📌 {day_date} — {shift_name}\n"
+
     await update.message.reply_text(msg)
+
+
+async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != USER_ID:
+        return
+
+    job_name = "test_job"
+    pending[job_name] = False
+
+    keyboard = [[InlineKeyboardButton("✅ סימנתי כניסה!", callback_data=f"confirm_{job_name}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "🧪 *זוהי הודעת טסט!*\n\n"
+        "🟢 תזכורת! עוד 5 דקות צריך לסמן *כניסה* למשמרת בוקר ב-Inspector\n\n"
+        "לחץ על הכפתור כדי לאשר — אחרת הבוט ימשיך לנודניק כל 10 דקות 😄",
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
+
+    # Schedule a nudge after 10 seconds for demo
+    context.job_queue.run_once(
+        nudge_reminder,
+        when=timedelta(seconds=10),
+        data={"action": "כניסה", "shift": "בוקר (טסט)", "job_name": job_name, "count": 1},
+        name=f"nudge_{job_name}_1",
+        chat_id=USER_ID,
+        user_id=USER_ID
+    )
 
 
 def main():
@@ -234,6 +294,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("set_shifts", set_shifts))
     app.add_handler(CommandHandler("list_shifts", list_shifts))
+    app.add_handler(CommandHandler("test", test_reminder))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.run_polling()
 
